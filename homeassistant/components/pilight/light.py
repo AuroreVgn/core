@@ -14,7 +14,7 @@ from homeassistant.components.light import (
 )
 from homeassistant.const import CONF_LIGHTS
 from homeassistant.core import HomeAssistant
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.typing import ConfigType, DiscoveryInfoType
 
@@ -62,7 +62,7 @@ class PilightLight(PilightBaseDevice, LightEntity):
         self._dimlevel_max = config.get(CONF_DIMLEVEL_MAX)
 
     @property
-    def brightness(self):
+    def brightness(self) -> int | None:
         """Return the brightness."""
         return self._brightness
 

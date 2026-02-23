@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from haphilipsjs import PhilipsTV
 from haphilipsjs.typing import AmbilightCurrentConfiguration
@@ -18,11 +18,10 @@ from homeassistant.components.light import (
 )
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 from homeassistant.util.color import color_hsv_to_RGB, color_RGB_to_hsv
 
-from . import PhilipsTVConfigEntry
-from .coordinator import PhilipsTVDataUpdateCoordinator
+from .coordinator import PhilipsTVConfigEntry, PhilipsTVDataUpdateCoordinator
 from .entity import PhilipsJsEntity
 
 EFFECT_PARTITION = ": "
@@ -35,7 +34,7 @@ EFFECT_EXPERT_STYLES = {"FOLLOW_AUDIO", "FOLLOW_COLOR", "Lounge light"}
 async def async_setup_entry(
     hass: HomeAssistant,
     config_entry: PhilipsTVConfigEntry,
-    async_add_entities: AddEntitiesCallback,
+    async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up the configuration entry."""
     coordinator = config_entry.runtime_data
@@ -136,6 +135,7 @@ def _average_pixels(data):
 class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
     """Representation of a Philips TV exposing the JointSpace API."""
 
+    _attr_effect: str
     _attr_translation_key = "ambilight"
 
     def __init__(
@@ -214,10 +214,10 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
         return ColorMode.ONOFF
 
     @property
-    def is_on(self):
+    def is_on(self) -> bool:
         """Return if the light is turned on."""
         if self._tv.on:
-            effect = AmbilightEffect.from_str(self.effect)
+            effect = AmbilightEffect.from_str(self._attr_effect)
             return effect.is_on(self._tv.powerstate)
 
         return False
@@ -329,7 +329,7 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
         """Turn the bulb on."""
         brightness = kwargs.get(ATTR_BRIGHTNESS, self.brightness)
         hs_color = kwargs.get(ATTR_HS_COLOR, self.hs_color)
-        attr_effect = kwargs.get(ATTR_EFFECT, self.effect)
+        attr_effect = cast(str, kwargs.get(ATTR_EFFECT, self.effect))
 
         if not self._tv.on:
             raise HomeAssistantError("TV is not available")

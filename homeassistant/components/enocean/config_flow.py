@@ -1,4 +1,4 @@
-"""Config flows for the ENOcean integration."""
+"""Config flows for the EnOcean integration."""
 
 from typing import Any
 
@@ -6,16 +6,28 @@ import voluptuous as vol
 
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult
 from homeassistant.const import CONF_DEVICE
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.selector import (
+    SelectSelector,
+    SelectSelectorConfig,
+    SelectSelectorMode,
+)
 
 from . import dongle
 from .const import DOMAIN, ERROR_INVALID_DONGLE_PATH, LOGGER
+
+MANUAL_SCHEMA = vol.Schema(
+    {
+        vol.Required(CONF_DEVICE): cv.string,
+    }
+)
 
 
 class EnOceanFlowHandler(ConfigFlow, domain=DOMAIN):
     """Handle the enOcean config flows."""
 
     VERSION = 1
-    MANUAL_PATH_VALUE = "Custom path"
+    MANUAL_PATH_VALUE = "manual"
 
     def __init__(self) -> None:
         """Initialize the EnOcean config flow."""
@@ -44,42 +56,44 @@ class EnOceanFlowHandler(ConfigFlow, domain=DOMAIN):
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Propose a list of detected dongles."""
-        errors = {}
         if user_input is not None:
             if user_input[CONF_DEVICE] == self.MANUAL_PATH_VALUE:
                 return await self.async_step_manual()
-            if await self.validate_enocean_conf(user_input):
-                return self.create_enocean_entry(user_input)
-            errors = {CONF_DEVICE: ERROR_INVALID_DONGLE_PATH}
-
-        bridges = await self.hass.async_add_executor_job(dongle.detect)
-        if len(bridges) == 0:
             return await self.async_step_manual(user_input)
 
-        bridges.append(self.MANUAL_PATH_VALUE)
+        devices = await self.hass.async_add_executor_job(dongle.detect)
+        if len(devices) == 0:
+            return await self.async_step_manual()
+        devices.append(self.MANUAL_PATH_VALUE)
+
         return self.async_show_form(
             step_id="detect",
-            data_schema=vol.Schema({vol.Required(CONF_DEVICE): vol.In(bridges)}),
-            errors=errors,
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_DEVICE): SelectSelector(
+                        SelectSelectorConfig(
+                            options=devices,
+                            translation_key="devices",
+                            mode=SelectSelectorMode.LIST,
+                        )
+                    )
+                }
+            ),
         )
 
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
         """Request manual USB dongle path."""
-        default_value = None
         errors = {}
         if user_input is not None:
             if await self.validate_enocean_conf(user_input):
                 return self.create_enocean_entry(user_input)
-            default_value = user_input[CONF_DEVICE]
             errors = {CONF_DEVICE: ERROR_INVALID_DONGLE_PATH}
 
         return self.async_show_form(
             step_id="manual",
-            data_schema=vol.Schema(
-                {vol.Required(CONF_DEVICE, default=default_value): str}
-            ),
+            data_schema=self.add_suggested_values_to_schema(MANUAL_SCHEMA, user_input),
             errors=errors,
         )
 

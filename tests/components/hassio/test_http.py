@@ -508,8 +508,14 @@ async def test_no_follow_logs_compress(
     hassio_client: TestClient, aioclient_mock: AiohttpClientMocker
 ) -> None:
     """Test that we do not compress follow logs."""
-    aioclient_mock.get("http://127.0.0.1/supervisor/logs/follow")
-    aioclient_mock.get("http://127.0.0.1/supervisor/logs")
+    aioclient_mock.get(
+        "http://127.0.0.1/supervisor/logs/follow",
+        headers={"Content-Type": "text/plain"},
+    )
+    aioclient_mock.get(
+        "http://127.0.0.1/supervisor/logs",
+        headers={"Content-Type": "text/plain"},
+    )
 
     resp1 = await hassio_client.get("/api/hassio/supervisor/logs/follow")
     resp2 = await hassio_client.get("/api/hassio/supervisor/logs")
@@ -527,7 +533,10 @@ async def test_forward_range_header_for_logs(
 ) -> None:
     """Test that we forward the Range header for logs."""
     aioclient_mock.get("http://127.0.0.1/host/logs")
+    aioclient_mock.get("http://127.0.0.1/host/logs/boots/-1")
+    aioclient_mock.get("http://127.0.0.1/host/logs/boots/-2/follow?lines=100")
     aioclient_mock.get("http://127.0.0.1/addons/123abc_esphome/logs")
+    aioclient_mock.get("http://127.0.0.1/addons/123abc_esphome/logs/follow")
     aioclient_mock.get("http://127.0.0.1/backups/1234abcd/download")
 
     test_range = ":-100:50"
@@ -535,24 +544,34 @@ async def test_forward_range_header_for_logs(
     host_resp = await hassio_client.get(
         "/api/hassio/host/logs", headers={"Range": test_range}
     )
+    host_resp2 = await hassio_client.get(
+        "/api/hassio/host/logs/boots/-1", headers={"Range": test_range}
+    )
+    host_resp3 = await hassio_client.get(
+        "/api/hassio/host/logs/boots/-2/follow?lines=100", headers={"Range": test_range}
+    )
     addon_resp = await hassio_client.get(
         "/api/hassio/addons/123abc_esphome/logs", headers={"Range": test_range}
+    )
+    addon_resp2 = await hassio_client.get(
+        "/api/hassio/addons/123abc_esphome/logs/follow", headers={"Range": test_range}
     )
     backup_resp = await hassio_client.get(
         "/api/hassio/backups/1234abcd/download", headers={"Range": test_range}
     )
 
     assert host_resp.status == HTTPStatus.OK
+    assert host_resp2.status == HTTPStatus.OK
+    assert host_resp3.status == HTTPStatus.OK
     assert addon_resp.status == HTTPStatus.OK
+    assert addon_resp2.status == HTTPStatus.OK
     assert backup_resp.status == HTTPStatus.OK
 
-    assert len(aioclient_mock.mock_calls) == 3
+    assert len(aioclient_mock.mock_calls) == 6
 
-    req_headers1 = aioclient_mock.mock_calls[0][-1]
-    assert req_headers1.get("Range") == test_range
-
-    req_headers2 = aioclient_mock.mock_calls[1][-1]
-    assert req_headers2.get("Range") == test_range
-
-    req_headers3 = aioclient_mock.mock_calls[2][-1]
-    assert req_headers3.get("Range") is None
+    assert aioclient_mock.mock_calls[0][-1].get("Range") == test_range
+    assert aioclient_mock.mock_calls[1][-1].get("Range") == test_range
+    assert aioclient_mock.mock_calls[2][-1].get("Range") == test_range
+    assert aioclient_mock.mock_calls[3][-1].get("Range") == test_range
+    assert aioclient_mock.mock_calls[4][-1].get("Range") == test_range
+    assert aioclient_mock.mock_calls[5][-1].get("Range") is None

@@ -8,23 +8,25 @@ from dataclasses import dataclass
 import logging
 from typing import TYPE_CHECKING, Any, cast
 
-from propcache import cached_property
+from propcache.api import cached_property
 import voluptuous as vol
 
-from homeassistant.components import websocket_api
+from homeassistant.components import automation, websocket_api
 from homeassistant.components.blueprint import CONF_USE_BLUEPRINT
+from homeassistant.components.labs import (
+    EventLabsUpdatedData,
+    async_subscribe_preview_feature,
+)
 from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_MODE,
     ATTR_NAME,
     CONF_ALIAS,
-    CONF_DEFAULT,
     CONF_DESCRIPTION,
     CONF_ICON,
     CONF_MODE,
     CONF_NAME,
     CONF_PATH,
-    CONF_SELECTOR,
     CONF_SEQUENCE,
     CONF_VARIABLES,
     SERVICE_RELOAD,
@@ -41,7 +43,7 @@ from homeassistant.core import (
     SupportsResponse,
     callback,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.config_validation import make_entity_service_schema
 from homeassistant.helpers.entity import ToggleEntity
 from homeassistant.helpers.entity_component import EntityComponent
@@ -60,7 +62,6 @@ from homeassistant.helpers.script import (
     ScriptRunResult,
     script_stack_cv,
 )
-from homeassistant.helpers.selector import selector
 from homeassistant.helpers.service import async_set_service_schema
 from homeassistant.helpers.trace import trace_get, trace_path
 from homeassistant.helpers.typing import ConfigType
@@ -74,7 +75,6 @@ from .const import (
     ATTR_LAST_TRIGGERED,
     ATTR_VARIABLES,
     CONF_FIELDS,
-    CONF_REQUIRED,
     CONF_TRACE,
     DOMAIN,
     ENTITY_ID_FORMAT,
@@ -238,8 +238,7 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     async def reload_service(service: ServiceCall) -> None:
         """Call a service to reload scripts."""
         await async_get_blueprints(hass).async_reset_cache()
-        if (conf := await component.async_prepare_reload(skip_reset=True)) is None:
-            return
+        conf = await component.async_prepare_reload(skip_reset=True)
         await _async_process_config(hass, conf, component)
 
     async def turn_on_service(service: ServiceCall) -> None:
@@ -284,6 +283,20 @@ async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
     hass.services.async_register(
         DOMAIN, SERVICE_TOGGLE, toggle_service, schema=SCRIPT_TURN_ONOFF_SCHEMA
     )
+
+    async def new_triggers_conditions_listener(
+        _event_data: EventLabsUpdatedData,
+    ) -> None:
+        """Handle new_triggers_conditions flag change."""
+        await reload_service(ServiceCall(hass, DOMAIN, SERVICE_RELOAD))
+
+    async_subscribe_preview_feature(
+        hass,
+        automation.DOMAIN,
+        automation.NEW_TRIGGERS_CONDITIONS_FEATURE_FLAG,
+        new_triggers_conditions_listener,
+    )
+
     websocket_api.async_register_command(hass, websocket_config)
 
     return True
@@ -734,40 +747,11 @@ class ScriptEntity(BaseScriptEntity, RestoreEntity):
 
         unique_id = self.unique_id
         hass = self.hass
-
-        service_schema = {}
-        for field_name, field_info in self.fields.items():
-            key_cls = vol.Required if field_info[CONF_REQUIRED] else vol.Optional
-            key_kwargs = {}
-            if CONF_DEFAULT in field_info:
-                key_kwargs["default"] = field_info[CONF_DEFAULT]
-
-            if CONF_SELECTOR in field_info:
-                validator: Any = selector(field_info[CONF_SELECTOR])
-
-                # Default values need to match the validator.
-                # When they don't match, we will not enforce validation
-                if CONF_DEFAULT in field_info:
-                    try:
-                        validator(field_info[CONF_DEFAULT])
-                    except vol.Invalid:
-                        logging.getLogger(f"{__name__}.{self._attr_unique_id}").warning(
-                            "Field %s has invalid default value %s",
-                            field_name,
-                            field_info[CONF_DEFAULT],
-                        )
-                        validator = cv.match_all
-
-            else:
-                validator = cv.match_all
-
-            service_schema[key_cls(field_name, **key_kwargs)] = validator
-
         hass.services.async_register(
             DOMAIN,
             unique_id,
             self._service_handler,
-            schema=vol.Schema(service_schema, extra=vol.ALLOW_EXTRA),
+            schema=SCRIPT_SERVICE_SCHEMA,
             supports_response=SupportsResponse.OPTIONAL,
         )
 

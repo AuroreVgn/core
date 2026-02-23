@@ -6,9 +6,8 @@ from typing import Any
 from unittest.mock import ANY, Mock, patch
 
 import pytest
-import voluptuous as vol
 
-from homeassistant.components import script
+from homeassistant.components import labs, script
 from homeassistant.components.script import DOMAIN, EVENT_SCRIPT_STARTED, ScriptEntity
 from homeassistant.config_entries import ConfigEntryState
 from homeassistant.const import (
@@ -43,13 +42,11 @@ from homeassistant.helpers.script import (
 )
 from homeassistant.helpers.service import async_get_all_descriptions
 from homeassistant.setup import async_setup_component
-from homeassistant.util import yaml
-import homeassistant.util.dt as dt_util
+from homeassistant.util import dt as dt_util, yaml as yaml_util
 
 from tests.common import (
     MockConfigEntry,
     MockUser,
-    async_capture_events,
     async_fire_time_changed,
     async_mock_service,
     mock_restore_cache,
@@ -559,101 +556,6 @@ async def test_reload_unchanged_script(
         assert len(calls) == 2
 
 
-async def test_service_schema(
-    hass: HomeAssistant, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Test that service schema are defined correctly."""
-    events = async_capture_events(hass, "test_event")
-
-    assert await async_setup_component(
-        hass,
-        "script",
-        {
-            "script": {
-                "test": {
-                    "fields": {
-                        "param_with_default": {
-                            "default": "default_value",
-                        },
-                        "required_param": {
-                            "required": True,
-                        },
-                        "selector_param": {
-                            "selector": {
-                                "select": {
-                                    "options": [
-                                        "one",
-                                        "two",
-                                    ]
-                                }
-                            }
-                        },
-                        "invalid_default": {
-                            "default": "invalid-value",
-                            "selector": {"number": {"min": 0, "max": 2}},
-                        },
-                    },
-                    "sequence": [
-                        {
-                            "event": "test_event",
-                            "event_data": {
-                                "param_with_default": "{{ param_with_default }}",
-                                "required_param": "{{ required_param }}",
-                                "selector_param": "{{ selector_param | default('not_set') }}",
-                                "invalid_default": "{{ invalid_default }}",
-                            },
-                        }
-                    ],
-                }
-            }
-        },
-    )
-
-    assert (
-        "Field invalid_default has invalid default value invalid-value" in caplog.text
-    )
-
-    await hass.services.async_call(
-        DOMAIN,
-        "test",
-        {"required_param": "required_value"},
-        blocking=True,
-    )
-    assert len(events) == 1
-    assert events[0].data["param_with_default"] == "default_value"
-    assert events[0].data["required_param"] == "required_value"
-    assert events[0].data["selector_param"] == "not_set"
-    assert events[0].data["invalid_default"] == "invalid-value"
-
-    with pytest.raises(vol.Invalid):
-        await hass.services.async_call(
-            DOMAIN,
-            "test",
-            {
-                "required_param": "required_value",
-                "selector_param": "invalid_value",
-            },
-            blocking=True,
-        )
-
-    await hass.services.async_call(
-        DOMAIN,
-        "test",
-        {
-            "param_with_default": "service_set_value",
-            "required_param": "required_value",
-            "selector_param": "one",
-            "invalid_default": "another-value",
-        },
-        blocking=True,
-    )
-    assert len(events) == 2
-    assert events[1].data["param_with_default"] == "service_set_value"
-    assert events[1].data["required_param"] == "required_value"
-    assert events[1].data["selector_param"] == "one"
-    assert events[1].data["invalid_default"] == "another-value"
-
-
 async def test_service_descriptions(hass: HomeAssistant) -> None:
     """Test that service descriptions are loaded and reloaded correctly."""
     # Test 1: has "description" but no "fields"
@@ -725,9 +627,6 @@ async def test_service_descriptions(hass: HomeAssistant) -> None:
 
     assert descriptions[DOMAIN]["test_name"]["name"] == "ABC"
 
-    # Test 4: verify that names from YAML are taken into account as well
-    assert descriptions[DOMAIN]["turn_on"]["name"] == "Turn on"
-
 
 async def test_shared_context(hass: HomeAssistant) -> None:
     """Test that the shared context is passed down the chain."""
@@ -752,14 +651,14 @@ async def test_shared_context(hass: HomeAssistant) -> None:
     assert event_mock.call_count == 1
     assert run_mock.call_count == 1
 
-    args, kwargs = run_mock.call_args
+    args, _kwargs = run_mock.call_args
     assert args[0].context == context
     # Ensure event data has all attributes set
     assert args[0].data.get(ATTR_NAME) == "test"
     assert args[0].data.get(ATTR_ENTITY_ID) == "script.test"
 
     # Ensure context carries through the event
-    args, kwargs = event_mock.call_args
+    args, _kwargs = event_mock.call_args
     assert args[0].context == context
 
     # Ensure the script state shares the same context
@@ -1819,7 +1718,7 @@ async def test_blueprint_script_fails_substitution(
     """Test blueprint script with bad inputs."""
     with patch(
         "homeassistant.components.blueprint.models.BlueprintInputs.async_substitute",
-        side_effect=yaml.UndefinedSubstitution("blah"),
+        side_effect=yaml_util.UndefinedSubstitution("blah"),
     ):
         assert await async_setup_component(
             hass,
@@ -1969,3 +1868,64 @@ async def test_script_queued_mode(hass: HomeAssistant) -> None:
 
     await hass.services.async_call("script", "test_main", blocking=True)
     assert calls == 4
+
+
+async def test_reload_when_labs_flag_changes(
+    hass: HomeAssistant,
+    hass_ws_client: WebSocketGenerator,
+) -> None:
+    """Test scripts are reloaded when labs flag changes."""
+    event = "test_event"
+    hass.states.async_set("test.script", "off")
+
+    ws_client = await hass_ws_client(hass)
+
+    assert await async_setup_component(
+        hass,
+        "script",
+        {
+            "script": {
+                "test": {
+                    "sequence": [
+                        {"event": event},
+                        {"wait_template": "{{ is_state('test.script', 'on') }}"},
+                    ]
+                }
+            }
+        },
+    )
+    assert await async_setup_component(hass, labs.DOMAIN, {})
+
+    assert hass.states.get(ENTITY_ID) is not None
+    assert hass.services.has_service(script.DOMAIN, "test")
+
+    for enabled, active_object_id, inactive_object_ids in (
+        (False, "test2", ("test",)),
+        (True, "test3", ("test", "test2")),
+    ):
+        with patch(
+            "homeassistant.config.load_yaml_config_file",
+            return_value={
+                "script": {active_object_id: {"sequence": [{"delay": {"seconds": 5}}]}}
+            },
+        ):
+            await ws_client.send_json_auto_id(
+                {
+                    "type": "labs/update",
+                    "domain": "automation",
+                    "preview_feature": "new_triggers_conditions",
+                    "enabled": enabled,
+                }
+            )
+
+            msg = await ws_client.receive_json()
+            assert msg["success"]
+            await hass.async_block_till_done()
+
+        for inactive_object_id in inactive_object_ids:
+            state = hass.states.get(f"script.{inactive_object_id}")
+            assert state.attributes["restored"] is True
+            assert not hass.services.has_service(script.DOMAIN, inactive_object_id)
+
+        assert hass.states.get(f"script.{active_object_id}") is not None
+        assert hass.services.has_service(script.DOMAIN, active_object_id)

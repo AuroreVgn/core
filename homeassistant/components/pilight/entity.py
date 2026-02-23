@@ -10,7 +10,7 @@ from homeassistant.const import (
     STATE_OFF,
     STATE_ON,
 )
-import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.restore_state import RestoreEntity
 
 from . import DOMAIN, EVENT, SERVICE_NAME
@@ -57,13 +57,14 @@ SWITCHES_SCHEMA = vol.Schema(
 class PilightBaseDevice(RestoreEntity):
     """Base class for pilight switches and lights."""
 
+    _attr_assumed_state = True
     _attr_should_poll = False
 
     def __init__(self, hass, name, config):
         """Initialize a device."""
         self._hass = hass
-        self._name = config.get(CONF_NAME, name)
-        self._is_on = False
+        self._attr_name = config.get(CONF_NAME, name)
+        self._attr_is_on = False
         self._code_on = config.get(CONF_ON_CODE)
         self._code_off = config.get(CONF_OFF_CODE)
 
@@ -86,27 +87,12 @@ class PilightBaseDevice(RestoreEntity):
 
         self._brightness = 255
 
-    async def async_added_to_hass(self):
+    async def async_added_to_hass(self) -> None:
         """Call when entity about to be added to hass."""
         await super().async_added_to_hass()
         if state := await self.async_get_last_state():
-            self._is_on = state.state == STATE_ON
+            self._attr_is_on = state.state == STATE_ON
             self._brightness = state.attributes.get("brightness")
-
-    @property
-    def name(self):
-        """Get the name of the switch."""
-        return self._name
-
-    @property
-    def assumed_state(self):
-        """Return True if unable to access real state of the entity."""
-        return True
-
-    @property
-    def is_on(self):
-        """Return true if switch is on."""
-        return self._is_on
 
     def _handle_code(self, call):
         """Check if received code by the pilight-daemon.
@@ -148,7 +134,7 @@ class PilightBaseDevice(RestoreEntity):
                     DOMAIN, SERVICE_NAME, self._code_off, blocking=True
                 )
 
-        self._is_on = turn_on
+        self._attr_is_on = turn_on
         self.schedule_update_ha_state()
 
     def turn_on(self, **kwargs):
