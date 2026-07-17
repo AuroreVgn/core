@@ -1,14 +1,12 @@
 """Local backup support for Core and Container installations."""
 
-from __future__ import annotations
-
 import asyncio
 from collections.abc import AsyncIterator, Callable, Coroutine
 import copy
 from dataclasses import dataclass, replace
 from io import BytesIO
 import json
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PureWindowsPath
 from queue import SimpleQueue
 import tarfile
 import threading
@@ -16,11 +14,13 @@ from typing import IO, Any, cast
 
 import aiohttp
 from securetar import (
+    InvalidPasswordError,
     SecureTarArchive,
     SecureTarError,
     SecureTarFile,
     SecureTarReadError,
     SecureTarRootKeyContext,
+    get_archive_max_ciphertext_size,
 )
 
 from homeassistant.core import HomeAssistant
@@ -34,7 +34,7 @@ from homeassistant.util.async_iterator import (
 from homeassistant.util.json import JsonObjectType, json_loads_object
 
 from .const import BUF_SIZE, LOGGER, SECURETAR_CREATE_VERSION
-from .models import AddonInfo, AgentBackup, Folder
+from .models import AddonInfo, AgentBackup, Folder, InvalidBackupFilename
 
 
 class DecryptError(HomeAssistantError):
@@ -109,6 +109,13 @@ def read_backup(backup_path: Path) -> AgentBackup:
         extra_metadata = cast(dict[str, bool | str], data.get("extra", {}))
         date = extra_metadata.get("supervisor.backup_request_date", data["date"])
 
+        name = cast(str, data["name"])
+        # The name is used to derive the on-disk filename via suggested_filename;
+        # reject anything that could escape the backup directory.
+        safe_name = PureWindowsPath(name).name
+        if safe_name != name or name in ("", ".", ".."):
+            raise InvalidBackupFilename(f"Invalid backup name: {name!r}")
+
         return AgentBackup(
             addons=addons,
             backup_id=cast(str, data["slug"]),
@@ -118,7 +125,7 @@ def read_backup(backup_path: Path) -> AgentBackup:
             folders=folders,
             homeassistant_included=homeassistant_included,
             homeassistant_version=homeassistant_version,
-            name=cast(str, data["name"]),
+            name=name,
             protected=cast(bool, data.get("protected", False)),
             size=backup_path.stat().st_size,
         )
@@ -165,7 +172,7 @@ def validate_password(path: Path, password: str | None) -> bool:
             ):
                 # If we can read the tar file, the password is correct
                 return True
-        except tarfile.ReadError, SecureTarReadError:
+        except tarfile.ReadError, InvalidPasswordError, SecureTarReadError:
             LOGGER.debug("Invalid password")
             return False
         except Exception:  # noqa: BLE001
@@ -192,13 +199,14 @@ def validate_password_stream(
         for obj in input_archive.tar:
             if not obj.name.endswith((".tar", ".tgz", ".tar.gz")):
                 continue
-            with input_archive.extract_tar(obj) as decrypted:
-                if decrypted.plaintext_size is None:
-                    raise UnsupportedSecureTarVersion
-                try:
+            try:
+                with input_archive.extract_tar(obj) as decrypted:
+                    if decrypted.plaintext_size is None:
+                        raise UnsupportedSecureTarVersion
                     decrypted.read(1)  # Read a single byte to trigger the decryption
-                except SecureTarReadError as err:
-                    raise IncorrectPassword from err
+            except (InvalidPasswordError, SecureTarReadError) as err:
+                raise IncorrectPassword from err
+            else:
                 return
     raise BackupEmpty
 
@@ -244,6 +252,8 @@ def decrypt_backup(
         except (DecryptError, SecureTarError, tarfile.TarError) as err:
             LOGGER.warning("Error decrypting backup: %s", err)
             error = err
+        except Abort:
+            raise
         except Exception as err:  # noqa: BLE001
             LOGGER.exception("Unexpected error when decrypting backup: %s", err)
             error = err
@@ -330,8 +340,10 @@ def encrypt_backup(
         except (EncryptError, SecureTarError, tarfile.TarError) as err:
             LOGGER.warning("Error encrypting backup: %s", err)
             error = err
+        except Abort:
+            raise
         except Exception as err:  # noqa: BLE001
-            LOGGER.exception("Unexpected error when decrypting backup: %s", err)
+            LOGGER.exception("Unexpected error when encrypting backup: %s", err)
             error = err
         else:
             # Pad the output stream to the requested minimum size
@@ -377,9 +389,12 @@ def _encrypt_backup(
         if prefix not in expected_archives:
             LOGGER.debug("Unknown inner tar file %s will not be encrypted", obj.name)
             continue
-        output_archive.import_tar(
-            input_tar.extractfile(obj), obj, derived_key_id=inner_tar_idx
-        )
+        if (fileobj := input_tar.extractfile(obj)) is None:
+            LOGGER.debug(
+                "Non regular inner tar file %s will not be encrypted", obj.name
+            )
+            continue
+        output_archive.import_tar(fileobj, obj, derived_key_id=inner_tar_idx)
         inner_tar_idx += 1
 
 
@@ -413,7 +428,7 @@ class _CipherBackupStreamer:
         hass: HomeAssistant,
         backup: AgentBackup,
         open_stream: Callable[[], Coroutine[Any, Any, AsyncIterator[bytes]]],
-        password: str | None,
+        password: str,
     ) -> None:
         """Initialize."""
         self._workers: list[_CipherWorkerStatus] = []
@@ -425,7 +440,9 @@ class _CipherBackupStreamer:
 
     def size(self) -> int:
         """Return the maximum size of the decrypted or encrypted backup."""
-        return self._backup.size + self._num_tar_files() * tarfile.RECORDSIZE
+        return get_archive_max_ciphertext_size(
+            self._backup.size, SECURETAR_CREATE_VERSION, self._num_tar_files()
+        )
 
     def _num_tar_files(self) -> int:
         """Return the number of inner tar files."""

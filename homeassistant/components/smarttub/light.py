@@ -1,6 +1,6 @@
 """Platform for light integration."""
 
-from typing import Any
+from typing import Any, override
 
 from smarttub import SpaLight
 
@@ -19,7 +19,6 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .const import ATTR_LIGHTS, DEFAULT_LIGHT_BRIGHTNESS, DEFAULT_LIGHT_EFFECT
 from .controller import SmartTubConfigEntry
 from .entity import SmartTubEntity
-from .helpers import get_spa_name
 
 PARALLEL_UPDATES = 0
 
@@ -56,8 +55,8 @@ class SmartTubLight(SmartTubEntity, LightEntity):
         super().__init__(coordinator, light.spa, "light")
         self.light_zone = light.zone
         self._attr_unique_id = f"{super().unique_id}-{light.zone}"
-        spa_name = get_spa_name(self.spa)
-        self._attr_name = f"{spa_name} Light {light.zone}"
+        self._attr_translation_key = "light_zone"
+        self._attr_translation_placeholders = {"zone": str(light.zone)}
 
     @property
     def light(self) -> SpaLight:
@@ -65,6 +64,7 @@ class SmartTubLight(SmartTubEntity, LightEntity):
         return self.coordinator.data[self.spa.id][ATTR_LIGHTS][self.light_zone]
 
     @property
+    @override
     def brightness(self) -> int:
         """Return the brightness of this light between 0..255."""
 
@@ -82,11 +82,13 @@ class SmartTubLight(SmartTubEntity, LightEntity):
         return round(brightness * 100 / 255)
 
     @property
+    @override
     def is_on(self) -> bool:
         """Return true if the light is on."""
         return self.light.mode != SpaLight.LightMode.OFF
 
     @property
+    @override
     def effect(self) -> str | None:
         """Return the current effect."""
         mode = self.light.mode.name.lower()
@@ -95,6 +97,7 @@ class SmartTubLight(SmartTubEntity, LightEntity):
         return None
 
     @property
+    @override
     def effect_list(self) -> list[str]:
         """Return the list of supported effects."""
         return [
@@ -119,6 +122,7 @@ class SmartTubLight(SmartTubEntity, LightEntity):
 
         return SpaLight.LightMode[effect.upper()]
 
+    @override
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the light on."""
 
@@ -130,6 +134,7 @@ class SmartTubLight(SmartTubEntity, LightEntity):
         await self.light.set_mode(mode, intensity)
         await self.coordinator.async_request_refresh()
 
+    @override
     async def async_turn_off(self, **kwargs: Any) -> None:
         """Turn the light off."""
         await self.light.set_mode(SpaLight.LightMode.OFF, 0)

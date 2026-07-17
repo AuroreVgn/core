@@ -25,6 +25,7 @@ from homeassistant.components.frontend import (
     EVENT_PANELS_UPDATED,
     THEMES_STORAGE_KEY,
     add_extra_js_url,
+    async_panel_exists,
     async_register_built_in_panel,
     async_remove_panel,
     remove_extra_js_url,
@@ -84,7 +85,7 @@ async def frontend(hass: HomeAssistant, ignore_frontend_deps: None) -> None:
     """Frontend setup with themes."""
     assert await async_setup_component(
         hass,
-        "frontend",
+        DOMAIN,
         {},
     )
 
@@ -94,7 +95,7 @@ async def frontend_themes(hass: HomeAssistant) -> None:
     """Frontend setup with themes."""
     assert await async_setup_component(
         hass,
-        "frontend",
+        DOMAIN,
         CONFIG_THEMES,
     )
 
@@ -141,7 +142,7 @@ async def mock_http_client_with_extra_js(
     """Start the Home Assistant HTTP component."""
     assert await async_setup_component(
         hass,
-        "frontend",
+        DOMAIN,
         {
             DOMAIN: {
                 CONF_EXTRA_MODULE_URL: ["/local/my_module.js"],
@@ -246,7 +247,7 @@ async def test_themes_persist(
         },
     }
 
-    assert await async_setup_component(hass, "frontend", CONFIG_THEMES)
+    assert await async_setup_component(hass, DOMAIN, CONFIG_THEMES)
     themes_ws_client = await hass_ws_client(hass)
 
     await themes_ws_client.send_json({"id": 5, "type": "frontend/get_themes"})
@@ -745,6 +746,18 @@ async def test_get_panels(
     assert "Removing unknown panel map" not in caplog.text
 
 
+@pytest.mark.usefixtures("frontend")
+async def test_async_panel_exists(hass: HomeAssistant) -> None:
+    """Test async_panel_exists helper."""
+    assert async_panel_exists(hass, "test_panel") is False
+
+    async_register_built_in_panel(hass, "test_panel")
+    assert async_panel_exists(hass, "test_panel") is True
+
+    async_remove_panel(hass, "test_panel")
+    assert async_panel_exists(hass, "test_panel") is False
+
+
 async def test_get_panels_non_admin(
     hass: HomeAssistant, ws_client: MockHAClientWebSocket, hass_admin_user: MockUser
 ) -> None:
@@ -1104,7 +1117,7 @@ async def test_www_local_dir(
 
     await hass.async_add_executor_job(_create_www_and_x_txt)
 
-    assert await async_setup_component(hass, "frontend", {})
+    assert await async_setup_component(hass, DOMAIN, {})
     client = await hass_client()
     resp = await client.get("/local/x.txt")
     assert resp.status == HTTPStatus.OK
@@ -1145,7 +1158,7 @@ async def test_setup_with_development_pr_and_token(
     mock_github_api,
     aioclient_mock: AiohttpClientMocker,
 ) -> None:
-    """Test that setup succeeds when both development_pr and github_token are provided."""
+    """Test setup with both development_pr and github_token."""
     hass.config.config_dir = str(tmp_path)
 
     aioclient_mock.get(
@@ -1268,7 +1281,7 @@ async def test_update_panel_partial(
     assert msg["result"]["climate"]["title"] == "HVAC"
     assert msg["result"]["climate"]["icon"] == "mdi:home-thermometer"
     assert msg["result"]["climate"]["require_admin"] is False
-    assert msg["result"]["climate"]["default_visible"] is False
+    assert msg["result"]["climate"]["default_visible"] is True
 
 
 async def test_update_panel_not_found(ws_client: MockHAClientWebSocket) -> None:
@@ -1325,7 +1338,7 @@ async def test_update_panel_persists(
         },
     }
 
-    assert await async_setup_component(hass, "frontend", {})
+    assert await async_setup_component(hass, DOMAIN, {})
     client = await hass_ws_client(hass)
 
     await client.send_json({"id": 1, "type": "get_panels"})
@@ -1376,35 +1389,37 @@ async def test_update_panel_reset_param(
     assert msg["result"]["security"]["icon"] == "mdi:security"
 
 
-async def test_update_panel_hide_sidebar(
+async def test_update_panel_toggle_show_in_sidebar(
     hass: HomeAssistant, ws_client: MockHAClientWebSocket
 ) -> None:
-    """Test that show_in_sidebar=false clears title and icon like lovelace."""
+    """Test that show_in_sidebar is returned without altering title and icon."""
     # Verify initial state has title and icon
     await ws_client.send_json({"id": 1, "type": "get_panels"})
     msg = await ws_client.receive_json()
     assert msg["result"]["light"]["title"] == "light"
     assert msg["result"]["light"]["icon"] == "mdi:lamps"
+    assert msg["result"]["light"]["show_in_sidebar"] is False
 
-    # Hide from sidebar
+    # Show in sidebar
     await ws_client.send_json(
         {
             "id": 2,
             "type": "frontend/update_panel",
             "url_path": "light",
-            "show_in_sidebar": False,
+            "show_in_sidebar": True,
         }
     )
     msg = await ws_client.receive_json()
     assert msg["success"]
 
-    # Title and icon should be None
+    # Title and icon should remain unchanged and show_in_sidebar should be True
     await ws_client.send_json({"id": 3, "type": "get_panels"})
     msg = await ws_client.receive_json()
-    assert msg["result"]["light"]["title"] is None
-    assert msg["result"]["light"]["icon"] is None
+    assert msg["result"]["light"]["title"] == "light"
+    assert msg["result"]["light"]["icon"] == "mdi:lamps"
+    assert msg["result"]["light"]["show_in_sidebar"] is True
 
-    # Show in sidebar again by resetting show_in_sidebar
+    # Reset show_in_sidebar to panel default
     await ws_client.send_json(
         {
             "id": 4,
@@ -1416,11 +1431,12 @@ async def test_update_panel_hide_sidebar(
     msg = await ws_client.receive_json()
     assert msg["success"]
 
-    # Title and icon should be restored
+    # show_in_sidebar should be restored to built-in default
     await ws_client.send_json({"id": 5, "type": "get_panels"})
     msg = await ws_client.receive_json()
     assert msg["result"]["light"]["title"] == "light"
     assert msg["result"]["light"]["icon"] == "mdi:lamps"
+    assert msg["result"]["light"]["show_in_sidebar"] is False
 
 
 async def test_panels_config_invalid_storage(
@@ -1436,7 +1452,7 @@ async def test_panels_config_invalid_storage(
         "data": "not_a_dict",
     }
 
-    assert await async_setup_component(hass, "frontend", {})
+    assert await async_setup_component(hass, DOMAIN, {})
     assert "Ignoring invalid panel storage data" in caplog.text
 
     client = await hass_ws_client(hass)

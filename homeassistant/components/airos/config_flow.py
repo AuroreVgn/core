@@ -1,12 +1,13 @@
 """Config flow for the Ubiquiti airOS integration."""
 
-from __future__ import annotations
-
 import asyncio
 from collections.abc import Mapping
 import logging
-from typing import Any
+from typing import Any, override
 
+from aiohttp import ClientSession, TCPConnector
+from airos.airos6 import AirOS6
+from airos.airos8 import AirOS8
 from airos.discovery import airos_discover_devices
 from airos.exceptions import (
     AirOSConnectionAuthenticationError,
@@ -16,7 +17,9 @@ from airos.exceptions import (
     AirOSEndpointError,
     AirOSKeyDataMissingError,
     AirOSListenerError,
+    AirOSTLSCompatibilityError,
 )
+from airos.helpers import DetectDeviceData, async_get_firmware_data
 import voluptuous as vol
 
 from homeassistant.config_entries import (
@@ -34,13 +37,16 @@ from homeassistant.const import (
 )
 from homeassistant.data_entry_flow import section
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.device_registry import format_mac
 from homeassistant.helpers.selector import (
     TextSelector,
     TextSelectorConfig,
     TextSelectorType,
 )
+from homeassistant.helpers.service_info.dhcp import DhcpServiceInfo
 
 from .const import (
+    CONF_LEGACY_SSL,
     DEFAULT_SSL,
     DEFAULT_USERNAME,
     DEFAULT_VERIFY_SSL,
@@ -49,11 +55,13 @@ from .const import (
     HOSTNAME,
     IP_ADDRESS,
     MAC_ADDRESS,
-    SECTION_ADVANCED_SETTINGS,
+    SECTION_ADDITIONAL_SETTINGS,
 )
-from .coordinator import AirOS8
+from .helpers import build_legacy_context
 
 _LOGGER = logging.getLogger(__name__)
+
+AirOSDeviceDetect = AirOS8 | AirOS6
 
 # Discovery duration in seconds, airOS announces every 20 seconds
 DISCOVER_INTERVAL: int = 30
@@ -62,7 +70,7 @@ STEP_DISCOVERY_DATA_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_USERNAME, default=DEFAULT_USERNAME): str,
         vol.Required(CONF_PASSWORD): str,
-        vol.Required(SECTION_ADVANCED_SETTINGS): section(
+        vol.Required(SECTION_ADDITIONAL_SETTINGS): section(
             vol.Schema(
                 {
                     vol.Required(CONF_SSL, default=DEFAULT_SSL): bool,
@@ -82,7 +90,7 @@ STEP_MANUAL_DATA_SCHEMA = STEP_DISCOVERY_DATA_SCHEMA.extend(
 class AirOSConfigFlow(ConfigFlow, domain=DOMAIN):
     """Handle a config flow for Ubiquiti airOS."""
 
-    VERSION = 2
+    VERSION = 3
     MINOR_VERSION = 1
 
     _discovery_task: asyncio.Task | None = None
@@ -90,12 +98,13 @@ class AirOSConfigFlow(ConfigFlow, domain=DOMAIN):
     def __init__(self) -> None:
         """Initialize the config flow."""
         super().__init__()
-        self.airos_device: AirOS8
+        self.airos_device: AirOSDeviceDetect
         self.errors: dict[str, str] = {}
         self.discovered_devices: dict[str, dict[str, Any]] = {}
         self.discovery_abort_reason: str | None = None
         self.selected_device_info: dict[str, Any] = {}
 
+    @override
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -123,26 +132,44 @@ class AirOSConfigFlow(ConfigFlow, domain=DOMAIN):
         )
 
     async def _validate_and_get_device_info(
-        self, config_data: dict[str, Any]
+        self,
+        config_data: dict[str, Any],
+        legacy: bool = False,
     ) -> dict[str, Any] | None:
         """Validate user input with the device API."""
         # By default airOS 8 comes with self-signed SSL certificates,
         # with no option in the web UI to change or upload a custom certificate.
-        session = async_get_clientsession(
-            self.hass,
-            verify_ssl=config_data[SECTION_ADVANCED_SETTINGS][CONF_VERIFY_SSL],
-        )
+        # Older airOS 6 devices may still lack proper levels
 
-        airos_device = AirOS8(
-            host=config_data[CONF_HOST],
-            username=config_data[CONF_USERNAME],
-            password=config_data[CONF_PASSWORD],
-            session=session,
-            use_ssl=config_data[SECTION_ADVANCED_SETTINGS][CONF_SSL],
-        )
+        close_session = False
+        verify_ssl = config_data[SECTION_ADDITIONAL_SETTINGS][CONF_VERIFY_SSL]
+
+        session = async_get_clientsession(self.hass, verify_ssl=verify_ssl)
+        if legacy:
+            session = ClientSession(
+                connector=TCPConnector(ssl=build_legacy_context(verify_ssl=verify_ssl))
+            )
+            close_session = True
+
         try:
-            await airos_device.login()
-            airos_data = await airos_device.status()
+            device_data: DetectDeviceData = await async_get_firmware_data(
+                host=config_data[CONF_HOST],
+                username=config_data[CONF_USERNAME],
+                password=config_data[CONF_PASSWORD],
+                session=session,
+                use_ssl=config_data[SECTION_ADDITIONAL_SETTINGS][CONF_SSL],
+            )
+
+        except AirOSTLSCompatibilityError:
+            # If already in legacy, stop iteration
+            if legacy:
+                self.errors["base"] = "cannot_connect"
+            else:
+                retry_config = dict(config_data)
+                retry_config[CONF_LEGACY_SSL] = True
+                return await self._validate_and_get_device_info(
+                    config_data=retry_config, legacy=True
+                )
 
         except (
             AirOSConnectionSetupError,
@@ -157,14 +184,18 @@ class AirOSConfigFlow(ConfigFlow, domain=DOMAIN):
             _LOGGER.exception("Unexpected exception during credential validation")
             self.errors["base"] = "unknown"
         else:
-            await self.async_set_unique_id(airos_data.derived.mac)
+            await self.async_set_unique_id(device_data["mac"])
 
             if self.source in [SOURCE_REAUTH, SOURCE_RECONFIGURE]:
                 self._abort_if_unique_id_mismatch()
             else:
                 self._abort_if_unique_id_configured()
 
-            return {"title": airos_data.host.hostname, "data": config_data}
+            return {"title": device_data["hostname"], "data": config_data}
+
+        finally:
+            if close_session:
+                await session.close()
 
         return None
 
@@ -232,18 +263,18 @@ class AirOSConfigFlow(ConfigFlow, domain=DOMAIN):
                             autocomplete="current-password",
                         )
                     ),
-                    vol.Required(SECTION_ADVANCED_SETTINGS): section(
+                    vol.Required(SECTION_ADDITIONAL_SETTINGS): section(
                         vol.Schema(
                             {
                                 vol.Required(
                                     CONF_SSL,
-                                    default=current_data[SECTION_ADVANCED_SETTINGS][
+                                    default=current_data[SECTION_ADDITIONAL_SETTINGS][
                                         CONF_SSL
                                     ],
                                 ): bool,
                                 vol.Required(
                                     CONF_VERIFY_SSL,
-                                    default=current_data[SECTION_ADVANCED_SETTINGS][
+                                    default=current_data[SECTION_ADDITIONAL_SETTINGS][
                                         CONF_VERIFY_SSL
                                     ],
                                 ): bool,
@@ -256,6 +287,7 @@ class AirOSConfigFlow(ConfigFlow, domain=DOMAIN):
             errors=self.errors,
         )
 
+    @override
     async def async_step_discovery(
         self,
         discovery_info: dict[str, Any] | None = None,
@@ -391,6 +423,19 @@ class AirOSConfigFlow(ConfigFlow, domain=DOMAIN):
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             pass
+
+    @override
+    async def async_step_dhcp(
+        self, discovery_info: DhcpServiceInfo
+    ) -> ConfigFlowResult:
+        """Automatically handle a DHCP discovered IP change."""
+        ip_address = discovery_info.ip
+        # python-airos defaults to upper for derived mac_address
+        normalized_mac = format_mac(discovery_info.macaddress).upper()
+        await self.async_set_unique_id(normalized_mac)
+
+        self._abort_if_unique_id_configured(updates={CONF_HOST: ip_address})
+        return self.async_abort(reason="unreachable")
 
     async def async_step_discovery_no_devices(
         self, user_input: dict[str, Any] | None = None
